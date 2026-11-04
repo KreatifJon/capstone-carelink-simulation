@@ -130,5 +130,6 @@ variable "admin_iam_arns" {
   default = [
     "arn:aws:iam::255945442255:user/students/ce13/jacksonlskit"
     , "arn:aws:iam::255945442255:user/students/ce13/shil5ram"
+    , "arn:aws:iam::255945442255:user/students/ce13/plainjon"
   ]
 }
