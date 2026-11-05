@@ -119,11 +119,6 @@ resource "aws_iam_role_policy_attachment" "eks_nodes" {
 # EKS Managed Node Group
 # ==============================================================================
 
-import {
-  to = aws_eks_node_group.main
-  id = "${local.cluster_id}:${local.name_prefix}-workers"
-}
-
 resource "aws_eks_node_group" "main" {
   cluster_name    = aws_eks_cluster.main.name
   node_group_name = "${local.name_prefix}-workers"
