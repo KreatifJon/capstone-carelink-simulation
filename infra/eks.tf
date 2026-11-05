@@ -92,6 +92,11 @@ data "aws_iam_policy_document" "eks_node_assume_role" {
   }
 }
 
+import {
+  to = aws_iam_role.eks_nodes
+  id = "${local.name_prefix}-eks-nodes"
+}
+
 resource "aws_iam_role" "eks_nodes" {
   name               = "${local.name_prefix}-eks-nodes"
   assume_role_policy = data.aws_iam_policy_document.eks_node_assume_role.json
@@ -111,8 +116,13 @@ resource "aws_iam_role_policy_attachment" "eks_nodes" {
 }
 
 # ==============================================================================
-# EKS Managed Node Group (2 x t3.medium Instances)
+# EKS Managed Node Group
 # ==============================================================================
+
+import {
+  to = aws_eks_node_group.main
+  id = "${local.cluster_id}:${local.name_prefix}-workers"
+}
 
 resource "aws_eks_node_group" "main" {
   cluster_name    = aws_eks_cluster.main.name
@@ -137,4 +147,3 @@ resource "aws_eks_node_group" "main" {
 
   depends_on = [aws_iam_role_policy_attachment.eks_nodes]
 }
-
