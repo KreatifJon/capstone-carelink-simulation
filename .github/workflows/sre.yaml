@@ -1,58 +1,225 @@
 name: "SRE: Health & Monitoring Check"
 
+# Read-only health audit of BOTH environments (staging and production).
+#
+# Needs the read-only SRE role from PR-B (oicd-bootstrap/iam-hardening.tf), which also
+# creates the repo variable AWS_SRE_ROLE_ARN. Until that exists the first step fails with a
+# clear message, so keep the schedule commented out until PR-B has been applied.
+#
+# The SRE role trusts only runs on the main branch, so "Run workflow" must be started from
+# main (a run from a feature branch cannot assume the role).
 on:
-  #schedule:
-  #  - cron: "0 */6 * * *"
+  # schedule:
+  #   - cron: "0 */6 * * *"   # enable after PR-B is applied: a red run emails repo watchers
   workflow_dispatch:
 
 permissions:
-  id-token: write
+  id-token: write # OIDC token for AWS
   contents: read
 
-jobs:
-  cloudwatch-health-audit:
-    name: "Audit CloudWatch Alarms & System Health"
-    runs-on: ubuntu-latest
-    timeout-minutes: 15 # Safeguard against stalled network or CLI calls
-    environment: production  # Authorizes the runner using the Production OIDC role
+concurrency:
+  group: sre-health
+  cancel-in-progress: false
 
+jobs:
+  health:
+    name: "SRE health (${{ matrix.environment }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15 # safeguard against stalled network or CLI calls
+    strategy:
+      fail-fast: false # one unhealthy environment must not hide the other
+      matrix:
+        environment: [staging, production]
+
+    # No `environment:` on purpose: a protected environment would pause every run for
+    # approval. This job only reads, through the read-only SRE role.
     env:
-      AWS_PAGER: "" # Disables pagination to prevent AWS CLI from hanging on large outputs
+      AWS_PAGER: "" # stop the AWS CLI from opening a pager
+      # Resource names follow infra/variables.tf: name_prefix = "<project>-<environment>"
+      PREFIX: carelink-sim-${{ matrix.environment }}
+      ENVIRONMENT: ${{ matrix.environment }}
 
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - name: Preflight (SRE role must exist)
+        env:
+          SRE_ROLE_ARN: ${{ vars.AWS_SRE_ROLE_ARN }}
+        run: |
+          if [ -z "$SRE_ROLE_ARN" ]; then
+            echo "::error title=AWS_SRE_ROLE_ARN is not set::Apply oicd-bootstrap/iam-hardening.tf (PR-B) first. It creates the read-only SRE role and this repository variable."
+            exit 1
+          fi
 
-      - name: Configure AWS Credentials
+      - name: Configure AWS credentials (read-only SRE role)
+        id: creds
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-to-assume: ${{ vars.AWS_SRE_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
           audience: sts.amazonaws.com
 
-      - name: Verify Assumed Identity
+      - name: Verify assumed identity
         run: aws sts get-caller-identity
 
-      - name: Check CloudWatch Alarms in ALARM State
+      # ------------------------------------------------------------------
+      # 1. CloudWatch alarms (created by infra/monitoring.tf)
+      # ------------------------------------------------------------------
+      - name: Alarms
+        if: ${{ !cancelled() && steps.creds.conclusion == 'success' }}
         run: |
-          echo "=== Querying Active Alarms in ALARM State (${{ vars.AWS_REGION }}) ==="
-          ALARMS=$(aws cloudwatch describe-alarms \
-            --state-value ALARM \
-            --query 'MetricAlarms[*].[AlarmName,MetricName,Namespace,StateUpdatedTimestamp]' \
-            --output table)
-          
-          echo "$ALARMS"
-          
-          COUNT=$(aws cloudwatch describe-alarms --state-value ALARM --query 'length(MetricAlarms)')
-          echo "Total active alarms: $COUNT"
-          if [ "$COUNT" -gt "0" ]; then
-            echo "::warning title=Active Alarms Detected::There are $COUNT alarms currently triggered in ${{ vars.AWS_REGION }}."
-            # Uncomment the line below if you want triggered alarms to fail the job (useful for email/Slack failure alerts)
-            # exit 1
+          set -uo pipefail
+          ALL=$(aws cloudwatch describe-alarms --alarm-name-prefix "${PREFIX}-" --output json)
+          TOTAL=$(jq '.MetricAlarms | length' <<<"$ALL")
+          FIRING=$(jq '[.MetricAlarms[] | select(.StateValue=="ALARM")] | length' <<<"$ALL")
+          NODATA=$(jq '[.MetricAlarms[] | select(.StateValue=="INSUFFICIENT_DATA")] | length' <<<"$ALL")
+
+          echo "=== ${ENVIRONMENT}: ${TOTAL} alarms, ${FIRING} in ALARM, ${NODATA} without data ==="
+          jq -r '.MetricAlarms[] | select(.StateValue=="ALARM") | "ALARM  \(.AlarmName)  since \(.StateUpdatedTimestamp)"' <<<"$ALL"
+          {
+            echo "### ${ENVIRONMENT}: alarms"
+            echo "Total: ${TOTAL}, in ALARM: ${FIRING}, no data: ${NODATA}"
+            jq -r '.MetricAlarms[] | select(.StateValue=="ALARM") | "- **\(.AlarmName)**: \(.StateReason)"' <<<"$ALL"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "::warning title=No alarms found (${ENVIRONMENT})::No alarm named ${PREFIX}-* exists in ${AWS_REGION}. Either infra/monitoring.tf is not applied yet, or this is the wrong region. A green run here is NOT proof that the system is healthy."
+          fi
+          if [ "$NODATA" -gt 0 ]; then
+            echo "::warning title=Alarms without data (${ENVIRONMENT})::${NODATA} alarm(s) are INSUFFICIENT_DATA. Check that Container Insights / the load balancer are sending metrics."
+          fi
+          if [ "$FIRING" -gt 0 ]; then
+            echo "::error title=Active alarms (${ENVIRONMENT})::${FIRING} alarm(s) in ALARM state in ${AWS_REGION}."
+            exit 1
           fi
 
-      - name: Query Recent System Log Groups
+      # ------------------------------------------------------------------
+      # 2. EKS cluster and node group (names from infra/vpc.tf and eks.tf)
+      # ------------------------------------------------------------------
+      - name: EKS cluster and nodes
+        if: ${{ !cancelled() && steps.creds.conclusion == 'success' }}
         run: |
-          echo "Checking CloudWatch Log Groups status in ${{ vars.AWS_REGION }}..."
-          aws logs describe-log-groups --limit 10 \
-            --query 'logGroups[*].[logGroupName,storedBytes]' --output table
+          set -uo pipefail
+          CLUSTER="${PREFIX}-eks"
+          NODEGROUP="${PREFIX}-workers"
+
+          if ! C=$(aws eks describe-cluster --name "$CLUSTER" --output json 2>&1); then
+            echo "::error title=EKS cluster not readable (${ENVIRONMENT})::${CLUSTER}: ${C//$'\n'/ }"
+            exit 1
+          fi
+          if ! N=$(aws eks describe-nodegroup --cluster-name "$CLUSTER" --nodegroup-name "$NODEGROUP" --output json 2>&1); then
+            echo "::error title=EKS node group not readable (${ENVIRONMENT})::${NODEGROUP}: ${N//$'\n'/ }"
+            exit 1
+          fi
+
+          CSTATUS=$(jq -r '.cluster.status' <<<"$C")
+          CVERSION=$(jq -r '.cluster.version' <<<"$C")
+          NSTATUS=$(jq -r '.nodegroup.status' <<<"$N")
+          ISSUES=$(jq '.nodegroup.health.issues | length' <<<"$N")
+          DESIRED=$(jq -r '.nodegroup.scalingConfig.desiredSize' <<<"$N")
+          MIN=$(jq -r '.nodegroup.scalingConfig.minSize' <<<"$N")
+
+          echo "cluster ${CLUSTER}: ${CSTATUS} (Kubernetes ${CVERSION})"
+          echo "node group ${NODEGROUP}: ${NSTATUS}, desired ${DESIRED}, min ${MIN}, health issues ${ISSUES}"
+          {
+            echo "### ${ENVIRONMENT}: EKS"
+            echo "Cluster ${CLUSTER}: **${CSTATUS}**, Kubernetes ${CVERSION}. Node group ${NODEGROUP}: **${NSTATUS}**, desired ${DESIRED}, health issues ${ISSUES}."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          RC=0
+          if [ "$CSTATUS" != "ACTIVE" ]; then
+            echo "::error title=EKS cluster not ACTIVE (${ENVIRONMENT})::${CLUSTER} is ${CSTATUS}."; RC=1
+          fi
+          if [ "$NSTATUS" != "ACTIVE" ] || [ "$ISSUES" -gt 0 ]; then
+            echo "::error title=EKS node group unhealthy (${ENVIRONMENT})::${NODEGROUP} is ${NSTATUS} with ${ISSUES} health issue(s)."
+            jq -r '.nodegroup.health.issues[] | "  \(.code): \(.message)"' <<<"$N"
+            RC=1
+          fi
+          if [ "$ENVIRONMENT" = "production" ] && [ "$DESIRED" -lt 2 ]; then
+            echo "::warning title=No node redundancy (production)::Desired node count is ${DESIRED}. Losing one node takes the whole cluster down."
+          fi
+          exit $RC
+
+      # ------------------------------------------------------------------
+      # 3. RDS instances (identifier = <prefix>-<logical name>, see infra/rds.tf)
+      # ------------------------------------------------------------------
+      - name: RDS instances
+        if: ${{ !cancelled() && steps.creds.conclusion == 'success' }}
+        run: |
+          set -uo pipefail
+          Q="DBInstances[?starts_with(DBInstanceIdentifier, '${PREFIX}-')].[DBInstanceIdentifier,DBInstanceStatus,MultiAZ,Engine]"
+          ROWS=$(aws rds describe-db-instances --query "$Q" --output json)
+          COUNT=$(jq 'length' <<<"$ROWS")
+          echo "=== ${ENVIRONMENT}: ${COUNT} database instance(s) ==="
+          jq -r '.[] | "\(.[0])  \(.[1])  MultiAZ=\(.[2])  \(.[3])"' <<<"$ROWS"
+          {
+            echo "### ${ENVIRONMENT}: RDS"
+            jq -r '.[] | "- \(.[0]): **\(.[1])**, Multi-AZ \(.[2]), \(.[3])"' <<<"$ROWS"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          RC=0
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error title=No databases found (${ENVIRONMENT})::No RDS instance named ${PREFIX}-* in ${AWS_REGION}."; RC=1
+          fi
+          BAD=$(jq -r '.[] | select(.[1] != "available") | "\(.[0]) is \(.[1])"' <<<"$ROWS")
+          if [ -n "$BAD" ]; then
+            echo "::error title=Database not available (${ENVIRONMENT})::${BAD//$'\n'/; }"; RC=1
+          fi
+          if [ "$ENVIRONMENT" = "production" ]; then
+            SINGLE=$(jq -r '.[] | select(.[2] == false) | .[0]' <<<"$ROWS")
+            if [ -n "$SINGLE" ]; then
+              echo "::warning title=Single-AZ database in production::${SINGLE//$'\n'/, } is not Multi-AZ, so an AZ failure is an outage (see docs/compliance-mapping.md)."
+            fi
+          fi
+          exit $RC
+
+      # ------------------------------------------------------------------
+      # 4. ECR: findings from the latest pushed image of each repository
+      #    (warning only: fixing image vulnerabilities belongs to the app team)
+      # ------------------------------------------------------------------
+      - name: ECR image scan findings
+        if: ${{ !cancelled() && steps.creds.conclusion == 'success' }}
+        run: |
+          set -uo pipefail
+          REPOS=$(aws ecr describe-repositories \
+            --query "repositories[?starts_with(repositoryName, '${PREFIX}-')].repositoryName" --output text)
+          if [ -z "$REPOS" ]; then
+            echo "::warning title=No ECR repositories (${ENVIRONMENT})::No repository named ${PREFIX}-* in ${AWS_REGION}."
+            exit 0
+          fi
+          echo "### ${ENVIRONMENT}: ECR latest-image scan" >> "$GITHUB_STEP_SUMMARY"
+          for REPO in $REPOS; do
+            R=$(aws ecr describe-images --repository-name "$REPO" \
+              --query 'sort_by(imageDetails,&imagePushedAt)[-1].[imageTags[0],imageScanStatus.status,imageScanFindingsSummary.findingSeverityCounts]' \
+              --output json 2>/dev/null || echo null)
+            if [ "$R" = "null" ] || [ -z "$R" ]; then
+              echo "${REPO}: no images pushed yet"
+              echo "- ${REPO}: no images yet" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            TAG=$(jq -r '.[0] // "untagged"' <<<"$R")
+            SCAN=$(jq -r '.[1] // "NOT_SCANNED"' <<<"$R")
+            CRIT=$(jq -r '.[2].CRITICAL // 0' <<<"$R")
+            HIGH=$(jq -r '.[2].HIGH // 0' <<<"$R")
+            echo "${REPO}:${TAG}  scan=${SCAN}  critical=${CRIT}  high=${HIGH}"
+            echo "- ${REPO}:${TAG}: scan ${SCAN}, critical ${CRIT}, high ${HIGH}" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$CRIT" -gt 0 ] || [ "$HIGH" -gt 0 ]; then
+              echo "::warning title=Image vulnerabilities (${ENVIRONMENT})::${REPO}:${TAG} has ${CRIT} critical and ${HIGH} high finding(s)."
+            fi
+          done
+
+      # ------------------------------------------------------------------
+      # 5. Log groups must expire (logs that never expire grow cost without limit)
+      # ------------------------------------------------------------------
+      - name: Log group retention
+        if: ${{ !cancelled() && steps.creds.conclusion == 'success' }}
+        run: |
+          set -uo pipefail
+          CLUSTER="${PREFIX}-eks"
+          Q="logGroups[?!retentionInDays && (starts_with(logGroupName,'/aws/eks/${CLUSTER}') || starts_with(logGroupName,'/aws/containerinsights/${CLUSTER}') || starts_with(logGroupName,'/aws/rds/instance/${PREFIX}-'))].logGroupName"
+          NOEXP=$(aws logs describe-log-groups --query "$Q" --output text)
+          if [ -n "$NOEXP" ]; then
+            for G in $NOEXP; do
+              echo "::warning title=Log group never expires (${ENVIRONMENT})::${G} has no retention policy. Set one in infra/monitoring.tf."
+            done
+          else
+            echo "All ${ENVIRONMENT} log groups have a retention policy."
+          fi
