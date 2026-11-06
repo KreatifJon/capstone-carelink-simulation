@@ -33,7 +33,12 @@ jobs:
           terraform_version: "1.10.0"
 
       - name: Check Formatting
-        run: terraform fmt -check
+        run: terraform fmt -check -recursive
+
+      - name: Validate
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
 
   # ---------------------------------------------------------------------------
   # Snyk Security Scan (Runs at root to read .snyk file)
@@ -62,7 +67,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [lint, snyk-scan]
-    environment: staging
+    # No `environment:` on purpose: a protected environment would pause every PR for approval.
+    # Planning uses the read-only plan role (trusted on the pull_request claim).
 
     defaults:
       run:
@@ -70,6 +76,8 @@ jobs:
 
     env:
       TF_IN_AUTOMATION: "true"
+      TF_VAR_alert_email: ${{ vars.ALERT_EMAIL }} # repo variable; never commit an address (public repo)
+      TF_VAR_project: carelink-sim
 
     steps:
       - name: Checkout Code
@@ -77,6 +85,8 @@ jobs:
 
       # -----------------------------------------------------------------------
       # DIAGNOSTIC STEP: Prints the exact JSON payload GitHub sends to AWS STS
+      # KEEP until the `sub` printed here (for a pull_request run) has been compared with
+      # the patterns in oicd-bootstrap/iam-hardening.tf; then remove this step.
       # -----------------------------------------------------------------------
       - name: Inspect GitHub OIDC Token
         run: |
@@ -88,10 +98,10 @@ jobs:
           echo "=== Decoded OIDC Token Claims ==="
           jq -R 'split(".") | .[1] | @base64d | fromjson' <<< "$RAW_TOKEN"
 
-      - name: Configure AWS Credentials (Staging)
+      - name: Configure AWS Credentials (read-only plan role)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
           audience: sts.amazonaws.com
 
@@ -104,11 +114,11 @@ jobs:
         run: |
           terraform init -input=false \
             -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
-            -backend-config="key=staging/terraform.tfstate" \
+            -backend-config="key=sim/staging/terraform.tfstate" \
             -backend-config="region=${{ vars.AWS_REGION }}"
 
       - name: Terraform Plan
-        run: terraform plan -input=false -var="environment=staging" -no-color
+        run: terraform plan -input=false -lock=false -var="environment=staging" -no-color
 
   # ---------------------------------------------------------------------------
   # Production Plan
@@ -118,7 +128,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [lint, snyk-scan]
-    environment: production
+    # No `environment:` on purpose (see plan-staging): the production plan must not pause for approval.
 
     defaults:
       run:
@@ -126,15 +136,17 @@ jobs:
 
     env:
       TF_IN_AUTOMATION: "true"
+      TF_VAR_alert_email: ${{ vars.ALERT_EMAIL }} # repo variable; never commit an address (public repo)
+      TF_VAR_project: carelink-sim
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Configure AWS Credentials (Production)
+      - name: Configure AWS Credentials (read-only plan role)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
           audience: sts.amazonaws.com
 
@@ -147,8 +159,8 @@ jobs:
         run: |
           terraform init -input=false \
             -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
-            -backend-config="key=production/terraform.tfstate" \
+            -backend-config="key=sim/production/terraform.tfstate" \
             -backend-config="region=${{ vars.AWS_REGION }}"
 
       - name: Terraform Plan
-        run: terraform plan -input=false -var="environment=production" -no-color
+        run: terraform plan -input=false -lock=false -var="environment=production" -no-color
